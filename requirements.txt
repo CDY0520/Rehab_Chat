@@ -1,13 +1,23 @@
-streamlit
-langchain
-langchain-community
-langchain-openai
-langchain-text-splitters
-openai
-faiss-cpu
-tiktoken
-python-dotenv
-pypdf
-unstructured[all-docs]
-numpy
-pandas
+# =====================================================
+# Project: Rehab_Chat
+# Description: Streamlit 기반 RAG 챗봇
+# Author: Dayeon Choi
+# Created: 2025-08-27
+# =====================================================
+
+# --- Core ---
+streamlit==1.38.0
+pymupdf==1.24.9                # PDF 텍스트 추출용
+numpy<2.3.0                    # OpenCV와 호환성 유지
+faiss-cpu==1.12.0              # 로컬 벡터 검색
+sentence-transformers==5.1.0    # 임베딩 모델
+scikit-learn==1.7.1
+
+# --- Optional (권장) ---
+opencv-python==4.12.0.88       # PDF 이미지 추출 등 추가 기능 시 사용
+Pillow==11.3.0                 # 이미지 처리용
+
+# --- Utility ---
+tqdm==4.67.1
+transformers==4.55.4
+huggingface-hub==0.34.4
