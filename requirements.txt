@@ -12,6 +12,7 @@ numpy<2.3.0                    # OpenCV와 호환성 유지
 faiss-cpu==1.12.0              # 로컬 벡터 검색
 sentence-transformers==5.1.0    # 임베딩 모델
 scikit-learn==1.7.1
+pdfplumber==0.11.0
 
 # --- Optional (권장) ---
 opencv-python==4.12.0.88       # PDF 이미지 추출 등 추가 기능 시 사용
