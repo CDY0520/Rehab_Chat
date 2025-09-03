@@ -1,191 +1,266 @@
-"""
-파일: rag/04_answer_demo.py
-목적: 질의 → FAISS 검색 → 규칙 기반(템플릿) 답변 생성 (+ 출처 표기, 안전 경고)
-옵션: OPENAI_API_KEY가 설정되어 있으면 LLM 요약 모드로도 답변 가능
+# 파일명: rag/04_answer_demo.py
+# 목적:
+#   - importlib으로 '03_search_demo.py' 동적 로드
+#   - get_retriever() 반환형 자동 해석 (dict/object/tuple/list/callable)
+#   - 카테고리 인지형 검색: 재정렬 + 오버페치 + 쿼리 확장
+# 사용:
+#   (.venv) python rag/04_answer_demo.py --query "근력운동 주의사항 알려줘" --top_k 3
 
-요구:
-  - sentence-transformers, faiss-cpu (이미 이전 단계에서 설치)
-  - (선택) openai==1.*  (키가 있을 때만)
-실행:
-  python rag/04_answer_demo.py
-"""
+from __future__ import annotations
 
+import argparse
+import sys
 from pathlib import Path
-import os
-import pickle
-from typing import List, Dict, Any
-from sentence_transformers import SentenceTransformer
-import faiss
+import importlib.util
+from typing import Any, Dict, List, Tuple
 
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except Exception:
-    HAS_OPENAI = False
 
-ROOT = Path(__file__).resolve().parents[1]
-VEC_DIR = ROOT / "data" / "vectorstore"
-FAISS_INDEX_PATH = VEC_DIR / "faiss.index"
-META_PATH        = VEC_DIR / "meta.pkl"
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) importlib 로드
+# ─────────────────────────────────────────────────────────────────────────────
+def load_search_demo() -> Any:
+    here = Path(__file__).resolve().parent
+    module_path = here / "03_search_demo.py"
+    if not module_path.exists():
+        raise FileNotFoundError(f"동적 로드 대상 파일을 찾을 수 없습니다: {module_path}")
 
-# -----------------------------
-# 공통 유틸
-# -----------------------------
-def load_index_meta_model():
-    index = faiss.read_index(str(FAISS_INDEX_PATH))
-    with open(META_PATH, "rb") as f:
-        meta = pickle.load(f)
-    model = SentenceTransformer(meta["model_name"])
-    return index, meta, model
+    spec = importlib.util.spec_from_file_location("search_demo", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("importlib이 spec 로드를 실패했습니다 (spec/loader None).")
 
-def search(q: str, top_k: int = 5,
-           category: str | None = None,
-           severity: str | None = None,
-           intent: str | None = None) -> List[Dict[str, Any]]:
-    """03_search_demo.py와 동일한 로직(필터 + 검색)"""
-    index, meta, model = load_index_meta_model()
-    candidates = list(range(len(meta["records"])))
-    if category:
-        candidates = [i for i in candidates if meta["records"][i].get("category") == category]
-    if severity:
-        candidates = [i for i in candidates if meta["records"][i].get("severity") == severity]
-    if intent:
-        candidates = [i for i in candidates if meta["records"][i].get("intent") == intent]
-    if not candidates:
-        return []
+    search_demo = importlib.util.module_from_spec(spec)
+    sys.modules["search_demo"] = search_demo
+    spec.loader.exec_module(search_demo)
+    return search_demo
 
-    q_emb = model.encode([q], normalize_embeddings=True).astype("float32")
-    D, I = index.search(q_emb, k=min(top_k*10, len(meta["texts"])))
 
-    hits = []
-    seen_text = set()
-    for dist, idx in zip(D[0], I[0]):
-        if idx not in candidates:
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) 타입 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+def _looks_like_faiss_index(obj: Any) -> bool:
+    return hasattr(obj, "search") and callable(getattr(obj, "search"))
+
+def _looks_like_st_model(obj: Any) -> bool:
+    return hasattr(obj, "encode") and callable(getattr(obj, "encode"))
+
+def _looks_like_items(obj: Any) -> bool:
+    return isinstance(obj, list) and (len(obj) == 0 or isinstance(obj[0], dict))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) (index, model, items)로 정규화
+# ─────────────────────────────────────────────────────────────────────────────
+def normalize_retriever_triplet(retr: Any) -> Tuple[Any, Any, List[Dict]]:
+    # dict
+    if isinstance(retr, dict):
+        idx = retr.get("index") or retr.get("faiss") or retr.get("faiss_index")
+        mdl = retr.get("model") or retr.get("encoder") or retr.get("st_model")
+        itm = retr.get("items") or retr.get("docs") or retr.get("metas")
+        if idx is not None and mdl is not None and itm is not None:
+            return idx, mdl, itm
+
+    # 객체 속성
+    if hasattr(retr, "index") and hasattr(retr, "model") and hasattr(retr, "items"):
+        return getattr(retr, "index"), getattr(retr, "model"), getattr(retr, "items")
+
+    # tuple/list
+    if isinstance(retr, (tuple, list)):
+        idx = mdl = itm = None
+        for x in retr:
+            if idx is None and _looks_like_faiss_index(x):
+                idx = x; continue
+            if mdl is None and _looks_like_st_model(x):
+                mdl = x; continue
+            if itm is None and _looks_like_items(x):
+                itm = x; continue
+        if idx is not None and mdl is not None and itm is not None:
+            return idx, mdl, itm
+
+    raise TypeError("retriever를 (index, model, items)로 정규화할 수 없습니다.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) FAISS 검색 (기본/오버페치 공용)
+# ─────────────────────────────────────────────────────────────────────────────
+def run_query_faiss(index: Any, model: Any, items: List[Dict], query: str, top_k: int) -> List[Dict]:
+    try:
+        import numpy as np
+    except Exception as e:
+        raise RuntimeError("numpy 임포트 실패. requirements를 확인하세요.") from e
+
+    q_emb = model.encode([query], normalize_embeddings=True)
+    if hasattr(q_emb, "astype"):
+        q_emb = q_emb.astype("float32")
+    else:
+        q_emb = np.array(q_emb, dtype="float32")
+
+    D, I = index.search(q_emb, top_k)
+    scores = D[0].tolist()
+    idxs = I[0].tolist()
+
+    results: List[Dict] = []
+    for rank, (i, sc) in enumerate(zip(idxs, scores), start=1):
+        if i < 0 or i >= len(items):
             continue
-        rec = meta["records"][idx]
-        text = rec["canonical_ko"].strip()
-        # 중복 문장 제거
-        key = " ".join(text.split())
-        if key in seen_text:
-            continue
-        seen_text.add(key)
-        hits.append({
-            "score": float(dist),
-            "id": rec["id"],
-            "text": text,
-            "category": rec.get("category"),
-            "severity": rec.get("severity"),
-            "intent": rec.get("intent"),
-            "source_title": rec.get("source_title"),
-            "source_page": rec.get("source_page"),
-            "source_orig_page": rec.get("source_orig_page"),
-        })
-        if len(hits) >= top_k:
-            break
-    return hits
+        meta = items[i] or {}
+        text = meta.get("text") or meta.get("sentence") or meta.get("content") or str(meta)
+        results.append({"rank": rank, "text": text, "meta": meta, "score": float(sc)})
+    return results
 
-# -----------------------------
-# 규칙 기반(템플릿) 답변 생성
-# -----------------------------
-def prioritize(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """High > Medium > Low 우선, 그 다음 점수 내림차순"""
-    sev_rank = {"High": 0, "Medium": 1, "Low": 2}
-    return sorted(results, key=lambda r: (sev_rank.get(r.get("severity","Low"), 3), -r["score"]))
 
-def format_sources(results: List[Dict[str, Any]]) -> str:
-    lines = []
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) 카테고리 인지 유틸(추론/재정렬/확장)
+# ─────────────────────────────────────────────────────────────────────────────
+CATEGORY_ALIASES = {
+    "운동 전 주의사항": ["운동 전", "운동전", "before exercise", "pre-exercise"],
+    "운동 중 주의사항": ["운동 중", "운동중", "during exercise", "중간"],
+    "운동 후 주의사항": ["운동 후", "운동후", "after exercise", "post-exercise"],
+    "근력운동 주의사항": ["근력운동", "저항운동", "웨이트", "strength", "resistance"],
+}
+
+def infer_category_from_query(query: str) -> str | None:
+    q = query.lower().replace(" ", "")
+    for cat, aliases in CATEGORY_ALIASES.items():
+        for a in aliases:
+            if a.replace(" ", "") in q:
+                return cat
+    return None
+
+def get_meta_category(meta: Dict) -> str:
+    return meta.get("category") or meta.get("Category") or meta.get("섹션") or meta.get("section") or ""
+
+def rerank_by_category(results: List[Dict], cat_hint: str | None) -> List[Dict]:
+    if not cat_hint:
+        return results
+    same, other = [], []
     for r in results:
-        page = r.get("source_orig_page") or r.get("source_page")
-        lines.append(f"- {r['source_title']} (p.{page}, {r['id']})")
-    # 중복 제거
-    uniq = []
-    seen = set()
-    for L in lines:
-        if L not in seen:
-            seen.add(L)
-            uniq.append(L)
-    return "\n".join(uniq)
+        (same if get_meta_category(r.get("meta", {}) or {}) == cat_hint else other).append(r)
+    return same + other
 
-def rule_based_answer(question: str, results: List[Dict[str, Any]]) -> str:
+def count_matches(results: List[Dict], cat_hint: str | None) -> int:
+    if not cat_hint:
+        return 0
+    return sum(1 for r in results if get_meta_category(r.get("meta", {}) or {}) == cat_hint)
+
+def build_expanded_query(query: str, cat_hint: str) -> str:
+    aliases = CATEGORY_ALIASES.get(cat_hint, [])
+    # 예: "근력운동 주의사항 알려줘 근력운동 저항운동 웨이트"
+    return query + " " + " ".join(aliases)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) 메인 로직
+# ─────────────────────────────────────────────────────────────────────────────
+def answer_demo(query: str, top_k: int = 3) -> None:
+    sd = load_search_demo()
+    if not hasattr(sd, "get_retriever"):
+        raise AttributeError("search_demo 모듈에 get_retriever 함수가 없습니다.")
+
+    retr = sd.get_retriever()
+
+    # 진단 로그
+    print("=== DEBUG: get_retriever() 반환 타입 진단 ===")
+    print("type:", type(retr))
+    if isinstance(retr, dict):
+        print("keys:", list(retr.keys()))
+    elif isinstance(retr, (list, tuple)):
+        print("len:", len(retr), "| elem types:", [type(x) for x in retr])
+    else:
+        attrs = [a for a in ["index", "model", "items", "search"] if hasattr(retr, a)]
+        print("has attrs:", attrs)
+    print("──────────────────────────────────────────")
+
+    # 1차 검색
+    if hasattr(sd, "search"):
+        try:
+            results = sd.search(retr, query, top_k=top_k)
+        except TypeError:
+            results = sd.search(retr, query)
+        # (sd.search 사용 시에도 카테고리 오버페치 보장을 위해 triplet 확보)
+        try:
+            index, model, items = normalize_retriever_triplet(retr)
+        except Exception:
+            index = model = items = None
+    elif callable(retr):
+        try:
+            results = retr(query, top_k=top_k)
+        except TypeError:
+            results = retr(query)
+        try:
+            index, model, items = normalize_retriever_triplet(retr)
+        except Exception:
+            index = model = items = None
+    else:
+        index, model, items = normalize_retriever_triplet(retr)
+        results = run_query_faiss(index, model, items, query, top_k)
+
+    # 정렬 + 카테고리 재정렬
+    results = sorted(results, key=lambda x: x.get("score", 0.0), reverse=True)
+    cat_hint = infer_category_from_query(query)
+    results = rerank_by_category(results, cat_hint)
+
+    # 매칭 수 확인
+    m_cnt = count_matches(results, cat_hint)
+    print(f"DEBUG: cat_hint={cat_hint!r}, 1st_match_count={m_cnt}")
+
+    # 2차: 오버페치 → 재정렬
+    if cat_hint and m_cnt == 0 and index is not None:
+        over_k = max(top_k * 10, 30)
+        results_big = run_query_faiss(index, model, items, query, over_k)
+        results_big = sorted(results_big, key=lambda x: x.get("score", 0.0), reverse=True)
+        results_big = rerank_by_category(results_big, cat_hint)
+        m_cnt2 = count_matches(results_big, cat_hint)
+        print(f"DEBUG: overfetch_k={over_k}, 2nd_match_count={m_cnt2}")
+        if m_cnt2 > 0:
+            results = results_big[:top_k]
+
+    # 3차: 쿼리 확장 → 오버페치
+    if cat_hint and count_matches(results, cat_hint) == 0 and index is not None:
+        q_exp = build_expanded_query(query, cat_hint)
+        results_big = run_query_faiss(index, model, items, q_exp, max(top_k * 10, 30))
+        results_big = sorted(results_big, key=lambda x: x.get("score", 0.0), reverse=True)
+        results_big = rerank_by_category(results_big, cat_hint)
+        m_cnt3 = count_matches(results_big, cat_hint)
+        print(f"DEBUG: expanded_query={q_exp!r}, 3rd_match_count={m_cnt3}")
+        if m_cnt3 > 0:
+            results = results_big[:top_k]
+
+    # 출력
+    print("\n=== ANSWER DEMO ===")
+    print(f"Query: {query}")
+    print(f"Top-K: {top_k}\n")
+
     if not results:
-        return "관련 근거를 찾지 못했어요. 질문을 조금 더 구체적으로 바꿔보거나 다른 표현을 시도해 주세요."
+        print("검색 결과가 없습니다.")
+        return
 
-    ordered = prioritize(results)
-    high_exists = any(r.get("severity") == "High" for r in ordered)
+    for r in results:
+        meta = r.get("meta", {}) or {}
+        cat = get_meta_category(meta)
+        line = r.get("text", "").strip()
+        score = float(r.get("score", 0.0))
+        if cat:
+            print(f"- [{cat}] {line}  (score={score:.3f})")
+        else:
+            print(f"- {line}  (score={score:.3f})")
 
-    bullets = []
-    for r in ordered:
-        tone = r.get("intent")
-        sev = r.get("severity")
-        prefix = "•"
-        if sev == "High":
-            prefix = "🚨"
-        elif sev == "Medium":
-            prefix = "⚠️"
-        elif tone == "권장":
-            prefix = "✅"
+    # Draft Answer
+    top_texts = [r.get("text", "") for r in results[:2]]
+    draft_answer = " ".join(t.strip() for t in top_texts if t.strip())
+    print("\n[Draft Answer]")
+    print(draft_answer if draft_answer else "상위 문맥을 기반으로 요약 답안을 생성할 수 없습니다.")
 
-        bullets.append(f"{prefix} {r['text']}")
 
-    src = format_sources(ordered)
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) CLI
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="RAG Answer Demo (category-aware with overfetch & expansion)")
+    p.add_argument("--query", type=str, default="운동 전 주의사항 알려줘")
+    p.add_argument("--top_k", type=int, default=3)
+    return p.parse_args()
 
-    header = "아래 근거를 바탕으로 정리했어요.\n"
-    if high_exists:
-        header = "🚨 안전 우선 안내\n위험 신호가 포함되어 있어 **먼저 안전 지침**을 따르세요.\n\n"
 
-    answer = (
-        f"{header}"
-        f"Q. {question}\n\n"
-        + "\n".join(bullets)
-        + "\n\n"
-        + "출처:\n"
-        + src
-    )
-    return answer
-
-# -----------------------------
-# (선택) LLM 요약 답변
-# -----------------------------
-def llm_answer(question: str, results: List[Dict[str, Any]]) -> str:
-    """OPENAI_API_KEY가 있을 때만 사용. 규칙기반 대비 자연스러움 강화."""
-    if not results or not HAS_OPENAI or not os.getenv("OPENAI_API_KEY"):
-        return rule_based_answer(question, results)
-
-    client = OpenAI()
-    ctx = "\n".join([f"- ({r['severity']}/{r['intent']}) {r['text']} [출처: {r['source_title']} p.{r.get('source_orig_page') or r.get('source_page')}]"
-                     for r in prioritize(results)])
-
-    prompt = f"""너는 뇌졸중 재활 운동 안전 가이드 챗봇이야.
-사용자 질문: {question}
-다음 근거를 안전도 순으로 요약해, 금지/주의/권장 우선순위로 안내하고 마지막에 출처를 나열해.
-근거:
-{ctx}
-출력 형식:
-- 핵심 지침 3~6줄 (금지/주의 먼저, 권장은 마지막)
-- '출처:' 아래에 문서명과 원본 페이지 번호를 줄바꿈으로 표기
-"""
-    chat = client.chat.completions.create(
-        model="gpt-4o-mini",  # 또는 가능한 채팅 모델
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.2,
-    )
-    return chat.choices[0].message.content.strip()
-
-# -----------------------------
-# 데모 실행
-# -----------------------------
 if __name__ == "__main__":
-    queries = [
-        "식사 직후 운동해도 돼?",
-        "운동 전 혈압 확인해야 해?",
-        "두통이 있으면 운동 가능해?",
-        "균형이 불안정할 때 어떻게 해야 해?"
-    ]
-    use_llm = bool(os.getenv("OPENAI_API_KEY")) and HAS_OPENAI
-
-    for q in queries:
-        results = search(q, top_k=5)
-        ans = llm_answer(q, results) if use_llm else rule_based_answer(q, results)
-        print("="*80)
-        print(ans)
-        print("="*80)
+    args = parse_args()
+    answer_demo(query=args.query, top_k=args.top_k)

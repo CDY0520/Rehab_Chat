@@ -1,74 +1,53 @@
 """
-파일: rag/03_build_faiss.py
-목적: precautions.jsonl -> 임베딩 생성 -> FAISS 인덱스 + 메타데이터 저장
-요구: sentence-transformers, faiss-cpu, pandas, numpy
+파일명: rag/03_build_faiss.py
+목적: precautions.jsonl 데이터를 임베딩 → FAISS 인덱스 빌드
+모델: intfloat/multilingual-e5-base (확정)
 """
 
 from pathlib import Path
 import json
-import pickle
 import numpy as np
-
-# 1) 한국어 포함 멀티링궐 임베딩 모델
-from sentence_transformers import SentenceTransformer
 import faiss
+from sentence_transformers import SentenceTransformer
+import unicodedata, re
 
 ROOT = Path(__file__).resolve().parents[1]
-IN_JSONL = ROOT / "data" / "processed" / "precautions.jsonl"
-OUT_DIR  = ROOT / "data" / "vectorstore"
+JSONL = ROOT / "data" / "processed" / "precautions.jsonl"
+OUT_DIR = ROOT / "data" / "vectorstore"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 저장 파일들
-FAISS_INDEX_PATH = OUT_DIR / "faiss.index"
-META_PATH        = OUT_DIR / "meta.pkl"
-MODEL_NAME       = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # KO 지원, 가벼움
+def normalize_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s).lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def load_records(path: Path):
-    records = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            records.append(json.loads(line))
-    return records
+# ✅ 확정 모델
+MODEL_NAME = "intfloat/multilingual-e5-base"
 
 def main():
-    if not IN_JSONL.exists():
-        raise FileNotFoundError(f"입력 파일 없음: {IN_JSONL}")
-    print("[1/4] JSONL 로드")
-    records = load_records(IN_JSONL)
-
-    texts = [r["canonical_ko"] for r in records]
-    ids   = [r["id"] for r in records]
-
-    print(f"[2/4] 임베딩 생성 (model={MODEL_NAME}, n={len(texts)})")
     model = SentenceTransformer(MODEL_NAME)
-    emb = model.encode(texts, batch_size=64, show_progress_bar=True, normalize_embeddings=True)
-    emb = np.asarray(emb, dtype="float32")
+    items = []
+    with JSONL.open("r", encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
+            text = (obj.get("canonical_ko") or obj.get("text") or "").strip()
+            if not text:
+                continue
+            obj["text"] = text
+            items.append(obj)
+    texts = [("passage: " + x["text"]) for x in items]  # E5 포맷
 
-    print("[3/4] FAISS 인덱스 빌드")
+    emb = model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+    emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+
     dim = emb.shape[1]
-    index = faiss.IndexFlatIP(dim)  # 코사인 유사도용: normalize_embeddings=True + Inner Product
+    index = faiss.IndexFlatIP(dim)
     index.add(emb)
-    faiss.write_index(index, str(FAISS_INDEX_PATH))
 
-    print("[4/4] 메타데이터 저장")
-    # 검색 시 문장/메타 참조용
-    meta = {
-        "ids": ids,
-        "texts": texts,
-        "records": records,  # 전체 메타 포함(category, severity, intent, source_title/page ...)
-        "model_name": MODEL_NAME,
-        "normalize": True,
-        "metric": "cosine/IP"
-    }
-    with open(META_PATH, "wb") as f:
-        pickle.dump(meta, f)
+    faiss.write_index(index, str(OUT_DIR / "faiss.index"))
+    np.save(OUT_DIR / "meta.npy", items)
 
-    print(f"[OK] 인덱스 저장: {FAISS_INDEX_PATH}")
-    print(f"[OK] 메타 저장   : {META_PATH}")
-    print(f"총 {len(records)}개 문장 인덱싱 완료")
+    print(f"FAISS index built with {len(items)} items using {MODEL_NAME}")
 
 if __name__ == "__main__":
     main()
